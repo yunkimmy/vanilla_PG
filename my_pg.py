@@ -12,7 +12,7 @@ from matplotlib.patches import Rectangle
 
 
 class Policy_gradient:
-    def __init__(self, env_name='CartPole-v0', lr=1e-2, batch_size=1, discount=0.9, epoch=1000, h_layer=[128]):
+    def __init__(self, env_name='CartPole-v0', lr=1e-2, batch_size=5000, discount=0.9, epoch=100, h_layer=[32]):
         self.env = gym.make(env_name)
         self.lr = lr
         self.batch_size = batch_size
@@ -24,7 +24,7 @@ class Policy_gradient:
         self.policy = self.build_mlp(h_layer)
         self.optimizer = Adam(self.policy.parameters(), lr=self.lr)
 
-    def build_mlp(self, h_layer, activation=nn.Tanh, output_activation=nn.Identity):
+    def build_mlp(self, h_layer, activation=nn.ReLU, output_activation=nn.Identity):
         # Build a feedforward neural network.
         layers = []
         sizes = [self.obs_dim] + h_layer + [self.act_dim] 
@@ -47,43 +47,63 @@ class Policy_gradient:
     def compute_loss(self, obs: torch.tensor, act: torch.tensor, weights: torch.tensor) -> torch.tensor:
         m = self.get_policy(obs)
         log_prob = m.log_prob(act)
-        loss = -log_prob * weights
+        loss = -(log_prob * weights)
         return loss.mean()
     
-    def sample_trajectory(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, int]:
-        observations = []
-        actions = []
-        rewards = []
+    def sample_batch(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, int]:
+        batch_obs = []       
+        batch_acts = []     
+        batch_weights = []    
+        batch_rets = []      
+        batch_lens = []    
 
-        obs = self.env.reset()
-        length = 0
+        obs =self.env.reset()
         done = False
-        while not done:
-            act = self.get_action(torch.from_numpy(obs).to(torch.float32))
-            obs, rew, done, _ = self.env.step(act)
-            observations.append(obs)
-            actions.append(act) 
-            rewards.append(rew)
-            length += 1
 
-        return np.array(observations), np.array(actions), np.array(rewards), length
+        eps_rew = []
+        while True:
+            act = self.get_action(torch.from_numpy(obs).to(torch.float32))
+            batch_obs.append(obs.copy())
+            obs, rew, done, _ = self.env.step(act)
+
+
+            batch_acts.append(act)
+            eps_rew.append(rew)
+
+            if done:
+                eps_ret = sum(eps_rew)
+                eps_len = len(eps_rew)
+                eps_weights = self.get_weights(eps_rew)
+                batch_weights.extend(eps_weights)
+                batch_rets.append(eps_ret)
+                batch_lens.append(eps_len)
+                obs = self.env.reset()
+                done = False
+                eps_rew = []
+            
+                if len(batch_obs) > self.batch_size:
+                    break
+        
+        return np.array(batch_obs), np.array(batch_acts), np.array(batch_weights), np.array(batch_rets), np.array(batch_lens)
+
     
-    def get_weights(self, rewards: list, update_type: str) -> np.ndarray:
+    def get_weights(self, rewards: list) -> list:
         R = 0
-        sum = 0
         weights = []
+
         for reward in reversed(rewards):
             R = reward + self.discount * R
             weights.append(R)
 
-        weights = np.array(weights)
-        weights = (weights - weights.mean())
-        return np.array(weights)
+        weights.reverse()
+
+        return weights
           
-    def update(self, obs: np.ndarray, actions: np.ndarray, rewards: np.ndarray):
-        weights = self.get_weights(rewards, "update_type")
+    def update(self, obs: np.ndarray, actions: np.ndarray, weights: np.ndarray):
         self.optimizer.zero_grad()
-        loss = self.compute_loss(torch.tensor(obs, dtype=torch.float32), torch.tensor(actions), torch.tensor(weights, dtype=torch.float32))
+        loss = self.compute_loss(torch.tensor(obs, dtype=torch.float32),
+                                  torch.tensor(actions, dtype=torch.int32),
+                                    torch.tensor(weights, dtype=torch.float32))
         loss.backward()
         self.optimizer.step()
         
@@ -91,12 +111,11 @@ class Policy_gradient:
 
     def train(self):
         for epoch in range(self.epoch):
-            obs, actions, rewards, length = self.sample_trajectory()
-            loss = self.update(obs, actions, rewards)
-            returns = np.sum(rewards)
-            if (epoch+1) % 100 == 0:
-                print("epoch: {}, loss: {}, return: {}, episode length: {}".format(
-                    epoch+1, loss, returns, length
+            obs, actions, weights, returns, length = self.sample_batch()
+            loss = self.update(obs, actions, weights)
+            if (epoch+1) % 10 == 0:
+                print("epoch: {}, loss: {:.3f}, return: {:.3f}, episode length: {:.3f}".format(
+                    epoch+1, loss.item(), np.mean(returns), np.mean(length)
                 ))
     
     def save_frames_as_gif(self, frames, path='./', filename='gym_animation.gif'):
